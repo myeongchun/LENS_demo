@@ -88,7 +88,7 @@ def execute(X, config, seed):
 
 def main():
     st.set_page_config(page_title="LENS Demo", layout="wide")
-    st.title("LENS: Unsupervised Anomaly Detection")
+    st.title("LENS: Learning an Ensemble of Normality Subspaces `Unsupervised Anomaly Detection")
     st.write("Upload a CSV or NPZ dataset, optionally specify labels, and run LENS.")
     st.caption("CPU execution · Labels are used for evaluation only · Higher scores indicate greater abnormality")
     root = Path(__file__).resolve().parent
