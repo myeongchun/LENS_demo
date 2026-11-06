@@ -113,11 +113,13 @@ def run_and_record(tensor, config, seed):
     import main as lens
 
     original_pca, original_combine = lens.weighted_pca, lens.combine_scores
-    spaces, combined = [], {}
+    spaces, combined, overhead = [], {}, [0.0]
 
     def recording_pca(X, weights, r, *args, **kwargs):
         result = original_pca(X, weights, r, *args, **kwargs)
+        started = time.perf_counter()
         spaces.append(principal_space(X, weights, float(r)))
+        overhead[0] += time.perf_counter() - started   # recording only, not part of LENS
         return result
 
     def recording_combine(member_scores, betas):
@@ -132,11 +134,11 @@ def run_and_record(tensor, config, seed):
         lens.weighted_pca, lens.combine_scores = original_pca, original_combine
     # run_lens keeps the members of rounds 0..T-1; a final rejected round may follow.
     count = combined["count"]
-    return scores, spaces[:count], combined["betas"]
+    return scores, spaces[:count], combined["betas"], overhead[0]
 
 
-def compress_ensemble(spaces, betas, scaled: np.ndarray, scores: np.ndarray) -> dict:
-    n, d = scaled.shape
+def build_compressed(spaces, betas, d: int) -> dict:
+    """Merge the members into one quadratic form: C, the center x*, and gamma (part of training)."""
     beta = np.clip(np.asarray(betas, dtype=np.float64), 1e-10, 1.0 - 1e-10)
     alpha = np.log(1.0 / beta)
     alpha /= alpha.sum() + 1e-10                          # utils/consensus.py
@@ -150,21 +152,29 @@ def compress_ensemble(spaces, betas, scaled: np.ndarray, scores: np.ndarray) -> 
     C = 0.5 * (C + C.T)
     center = np.linalg.lstsq(C, b, rcond=None)[0]         # most normal point x*
     gamma = (c - float(b @ center)) / d
-    weights, directions = np.linalg.eigh(C)
+    return {"C": C, "center": center, "gamma": gamma, "count": len(spaces),
+            "dims": [V.shape[1] for _, V in spaces], "alpha": alpha.tolist()}
+
+
+def compressed_scores(model: dict, X: np.ndarray) -> np.ndarray:
+    """Inference with the compressed model: one quadratic form per sample."""
+    diff = model["scaler"].transform(X) - model["center"]
+    return np.einsum("ij,ij->i", diff @ model["C"], diff) / diff.shape[1] + model["gamma"]
+
+
+def add_interpretation(model: dict, scaled: np.ndarray, scores: np.ndarray, inferred: np.ndarray) -> None:
+    """Eigen-directions of C and each direction's share of the score (display only, not timed)."""
+    n, d = scaled.shape
+    weights, directions = np.linalg.eigh(model["C"])
     weights = np.clip(weights[::-1], 0.0, None)
     directions = directions[:, ::-1].copy()
     flip = directions[np.abs(directions).argmax(axis=0), np.arange(d)] < 0
     directions[:, flip] *= -1                              # largest loading positive
-    totals, compressed = np.zeros(d), np.empty(n)
+    totals = np.zeros(d)
     for start in range(0, n, 4096):
-        terms = ((scaled[start:start + 4096] - center) @ directions) ** 2 * weights / d
-        totals += terms.sum(axis=0)
-        compressed[start:start + 4096] = terms.sum(axis=1) + gamma
-    gap = float(np.max(np.abs(compressed - scores)) / max(np.max(np.abs(scores)), 1e-12))
-    return {"C": C, "center": center, "gamma": gamma, "weights": weights,
-            "directions": directions, "share": totals / max(totals.sum(), 1e-300),
-            "gap": gap, "count": len(spaces), "dims": [V.shape[1] for _, V in spaces],
-            "alpha": alpha.tolist()}
+        totals += (((scaled[start:start + 4096] - model["center"]) @ directions) ** 2 * weights / d).sum(axis=0)
+    model.update(weights=weights, directions=directions, share=totals / max(totals.sum(), 1e-300),
+                 gap=float(np.max(np.abs(inferred - scores)) / max(np.max(np.abs(scores)), 1e-12)))
 
 
 def execute(X, config, seed):
@@ -178,13 +188,21 @@ def execute(X, config, seed):
     with execution_lock():
         tensor = torch.as_tensor(scaled, dtype=torch.float32, device="cpu")
         with torch.inference_mode():
-            scores, spaces, betas = run_and_record(tensor, config, seed)
-    elapsed = time.perf_counter() - started
+            scores, spaces, betas, overhead = run_and_record(tensor, config, seed)
+    model = build_compressed(spaces, betas, X.shape[1])
+    train_seconds = time.perf_counter() - started - overhead
     if len(scores) != len(X) or not np.isfinite(scores).all():
         raise ValueError("LENS returned invalid anomaly scores.")
-    model = compress_ensemble(spaces, betas, scaled, scores)
     model["scaler"] = scaler
-    return scores, model, elapsed
+    started = time.perf_counter()
+    inferred = compressed_scores(model, X)
+    inference_seconds = time.perf_counter() - started
+    add_interpretation(model, scaled, scores, inferred)
+    return scores, model, {"train": train_seconds, "inference": inference_seconds}
+
+
+def format_seconds(value: float) -> str:
+    return f"{value:.2f} sec" if value >= 1 else f"{value:.3f} sec" if value >= 0.001 else f"{value:.4f} sec"
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +381,7 @@ def main():
         st.session_state.pop("lens_result", None)
         try:
             with st.spinner("Running LENS…"):
-                scores, model, elapsed = execute(X, config, int(seed))
+                scores, model, timing = execute(X, config, int(seed))
             metrics = {}
             result = pd.DataFrame({"sample_index": np.arange(len(X)), "anomaly_score": scores})
             if y is not None:
@@ -376,7 +394,8 @@ def main():
             report = {"source_file": uploaded.name, "samples": len(X), "features": feature_names,
                       "config": config, "seed": int(seed), "device": "cpu",
                       "preprocessing": "MinMaxScaler [0, 1]", "anomaly_values": anomaly_values,
-                      "metrics": metrics, "elapsed_seconds": elapsed,
+                      "metrics": metrics, "train_seconds": timing["train"],
+                      "inference_seconds": timing["inference"],
                       "compression": {"latent_spaces": model["count"], "dims": model["dims"],
                                       "max_relative_difference": model["gap"]}}
             st.session_state["lens_result"] = (signature, result, report, model)
@@ -386,7 +405,10 @@ def main():
     saved = st.session_state.get("lens_result")
     if saved and saved[0] == signature:
         _, result, report, model = saved
-        st.success(f"Completed in {report['elapsed_seconds']:.2f} seconds")
+        st.success(f"Train: {format_seconds(report['train_seconds'])} · "
+                   f"Inference: {format_seconds(report['inference_seconds'])}")
+        st.caption("Train covers building the ensemble and merging it into one scoring function. "
+                   "Inference scores every sample with that merged function.")
         scores_tab, interpretation_tab = st.tabs(["Scores", "Interpretation"])
         with scores_tab:
             for name, value in report["metrics"].items():
